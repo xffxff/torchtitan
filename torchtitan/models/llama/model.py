@@ -15,6 +15,8 @@ import torch.nn.functional as F
 from torch import nn
 from torchtitan.models.norms import build_norm
 
+from .moe_layer import MoELayer
+
 
 @dataclass
 class ModelArgs:
@@ -33,6 +35,10 @@ class ModelArgs:
     # `False`, each uses the total number of transformer blocks
     depth_init: bool = True
     norm_type: str = "rmsnorm"
+
+    moe_num_experts: int = 8
+    moe_top_k: int = 2
+    moe_expert_dim: int = 1024
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:
@@ -283,11 +289,11 @@ class TransformerBlock(nn.Module):
         self.n_heads = model_args.n_heads
         self.dim = model_args.dim
         self.attention = Attention(model_args)
-        self.feed_forward = FeedForward(
-            dim=model_args.dim,
-            hidden_dim=4 * model_args.dim,
-            multiple_of=model_args.multiple_of,
-            ffn_dim_multiplier=model_args.ffn_dim_multiplier,
+        self.feed_forward = MoELayer(
+            model_args.dim,
+            model_args.moe_expert_dim,
+            model_args.moe_num_experts,
+            model_args.moe_top_k,
         )
         self.layer_id = layer_id
         self.num_layers = model_args.n_layers
@@ -321,7 +327,8 @@ class TransformerBlock(nn.Module):
 
         """
         h = x + self.attention(self.attention_norm(x), freqs_cis)
-        out = h + self.feed_forward(self.ffn_norm(h))
+        feed_forward_out = self.feed_forward(self.ffn_norm(h))
+        out = h + feed_forward_out
         return out
 
     def init_weights(self):

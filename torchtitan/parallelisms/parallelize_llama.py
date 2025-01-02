@@ -8,6 +8,7 @@
 # training techniques (e.g. activation checkpointing and compile) to the Llama model.
 
 from collections import defaultdict
+from typing import Dict, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -23,6 +24,7 @@ from torch.distributed._tensor import Replicate, Shard
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper as ptd_checkpoint_wrapper,
 )
+from torch.distributed.tensor import DTensor, Partial, Placement
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
     parallelize_module,
@@ -34,6 +36,88 @@ from torch.distributed.tensor.parallel import (
 from torchtitan.config_manager import JobConfig, TORCH_DTYPE_MAP
 from torchtitan.logging import logger
 from torchtitan.parallelisms.parallel_dims import ParallelDims
+
+
+class PrepareMoEInputOutput(PrepareModuleInput):
+    def __init__(
+        self,
+        *,
+        input_layouts: Optional[Union[Placement, Tuple[Optional[Placement]]]] = None,
+        desired_input_layouts: Optional[
+            Union[Placement, Tuple[Optional[Placement]]]
+        ] = None,
+        input_kwarg_layouts: Optional[Dict[str, Placement]] = None,
+        desired_input_kwarg_layouts: Optional[Dict[str, Placement]] = None,
+        use_local_output: bool = False,
+        output_layouts: Optional[Union[Placement, Tuple[Optional[Placement]]]] = None,
+        desired_output_layouts: Optional[
+            Union[Placement, Tuple[Optional[Placement]]]
+        ] = None,
+    ):
+        super().__init__(
+            input_layouts=input_layouts,
+            desired_input_layouts=desired_input_layouts,
+            input_kwarg_layouts=input_kwarg_layouts,
+            desired_input_kwarg_layouts=desired_input_kwarg_layouts,
+            use_local_output=use_local_output,
+        )
+
+        self.output_layouts = output_layouts
+        self.desired_output_layouts = desired_output_layouts
+
+    def _prepare_out_fn(self, outputs, device_mesh):
+        prepared_outputs = []
+        if not isinstance(outputs, tuple):
+            outputs = (outputs,)
+        if len(outputs) != len(self.output_layouts):
+            raise ValueError(
+                "module outputs and output_layouts should have same length!"
+            )
+        for out, out_layout, desired_out_layout in zip(
+            outputs, self.output_layouts, self.desired_output_layouts
+        ):
+            if out_layout is not None:
+                if isinstance(out, DTensor):
+                    # TODO: re-enable the check once we fix the compile path
+                    # assert out.placements[0] == out_layout
+                    dt_out = out
+                else:
+                    dt_out = DTensor.from_local(
+                        out, device_mesh, (out_layout,), run_check=False
+                    )
+
+                if out_layout != desired_out_layout:
+                    dt_out = dt_out.redistribute(placements=(desired_out_layout,))
+                prepared_outputs.append(
+                    dt_out.to_local() if self.use_local_output else dt_out
+                )
+            else:
+                prepared_outputs.append(out)
+        if len(prepared_outputs) == 1:
+            return prepared_outputs[0]
+        else:
+            return tuple(prepared_outputs)
+
+    def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
+        # for input
+        if self.with_kwargs:
+            module.register_forward_pre_hook(
+                lambda _, inputs, kwargs: self._prepare_input_kwarg_fn(
+                    inputs, kwargs, device_mesh
+                ),
+                with_kwargs=True,
+            )  # type: ignore[misc]
+        else:
+            module.register_forward_pre_hook(
+                lambda _, inputs: self._prepare_input_fn(inputs, device_mesh)
+            )  # type: ignore[misc, call-arg]
+
+        # for output
+        module.register_forward_hook(
+            lambda _, inputs, outputs: self._prepare_out_fn(outputs, device_mesh)
+        )  # type: ignore[misc, call-arg]
+
+        return module
 
 
 def parallelize_llama(
@@ -183,13 +267,14 @@ def apply_tp(
             "attention.wv": colwise_parallel(),
             "attention.wo": rowwise_parallel(output_layouts=Shard(1)),
             "ffn_norm": SequenceParallel(),
-            "feed_forward": prepare_module_input(
+            "feed_forward.router.gate": colwise_parallel(output_layouts=Replicate()),
+            "feed_forward": PrepareMoEInputOutput(
                 input_layouts=(Shard(1),),
                 desired_input_layouts=(Replicate(),),
+                output_layouts=(Partial(),),
+                desired_output_layouts=(Shard(1),),
+                use_local_output=True,
             ),
-            "feed_forward.w1": colwise_parallel(),
-            "feed_forward.w2": rowwise_parallel(output_layouts=Shard(1)),
-            "feed_forward.w3": colwise_parallel(),
         }
 
         parallelize_module(
@@ -197,6 +282,19 @@ def apply_tp(
             device_mesh=tp_mesh,
             parallelize_plan=layer_plan,
         )
+
+        experts = transformer_block.feed_forward.experts.experts
+        for expert in experts:
+            layer_plan = {
+                "w1": colwise_parallel(),
+                "w2": rowwise_parallel(),
+                "w3": colwise_parallel(),
+            }
+            parallelize_module(
+                module=expert,
+                device_mesh=tp_mesh,
+                parallelize_plan=layer_plan,
+            )
 
     if enable_async_tp:
         from torch.distributed._symmetric_memory import enable_symm_mem_for_group
